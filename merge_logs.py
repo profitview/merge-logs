@@ -30,10 +30,21 @@ run the tool again. The result is written to a temporary file and swapped in
 atomically, so an interrupted run never damages the existing log. Use --fresh to
 ignore an existing output and rebuild from the export files only.
 
+Split output
+------------
+--split month|quarter|year writes one file per period instead of a single log,
+named after the output file: profitview-merged-2026-02.log (month),
+profitview-merged-2026-q1.log (quarter), profitview-merged-2026.log (year).
+Concatenated in period order the files are byte-identical to the single log.
+Every existing merged output next to the output file, whether unsplit or split
+at any granularity, is read back as merge base, so the granularity can be
+changed between runs.
+
 Usage
 -----
   python merge_logs.py                          # current dir -> profitview-merged.log
   python merge_logs.py . old -o merged.log      # several input dirs
+  python merge_logs.py --split month            # profitview-merged-YYYY-MM.log files
   python merge_logs.py --fresh                  # ignore existing output, rebuild
   python merge_logs.py logs/ -o out.log --report report.txt
   python merge_logs.py --dry-run                # analyse only, write nothing
@@ -88,6 +99,9 @@ JITTER_WINDOW = timedelta(seconds=5)
 SEAM_JUMP = timedelta(minutes=30)
 
 DEFAULT_OUTPUT = "profitview-merged.log"
+
+# Output split granularities; "none" writes a single file.
+SPLIT_CHOICES = ("none", "month", "quarter", "year")
 
 # Read/write settings that make the pass byte-exact: surrogateescape round-trips
 # bytes that are not valid UTF-8, newline="" keeps original CRLF line endings.
@@ -213,6 +227,7 @@ class ExportSet:
         self.shift = 0  # hours this set is rendered ahead of the previous set
         self.offset = 0  # hours ahead of the first set (cumulative)
         self.shift_confidence = None  # share of votes for the winning shift
+        self.name = None  # display label override
 
     @property
     def paths(self):
@@ -224,7 +239,7 @@ class ExportSet:
 
     @property
     def label(self):
-        return os.path.basename(self.paths[0])
+        return self.name or os.path.basename(self.paths[0])
 
     def total_bytes(self):
         return sum(os.path.getsize(p) for p in self.paths)
@@ -437,12 +452,146 @@ def peek_first_timestamp(paths, max_lines=100000):
 
 
 # ---------------------------------------------------------------------------
+# Output: single file or one file per period
+# ---------------------------------------------------------------------------
+
+
+def period_of(ts, split):
+    """Sortable period key of a timestamp: (year, month|quarter|0)."""
+    if split == "month":
+        return (ts.year, ts.month)
+    if split == "quarter":
+        return (ts.year, (ts.month - 1) // 3 + 1)
+    return (ts.year, 0)
+
+
+def split_path(abs_out, split, period):
+    """"x/profitview-merged.log" -> "x/profitview-merged-2026-02.log" etc."""
+    year, sub = period
+    if split == "month":
+        tag = f"{year:04d}-{sub:02d}"
+    elif split == "quarter":
+        tag = f"{year:04d}-q{sub}"
+    else:
+        tag = f"{year:04d}"
+    stem, ext = os.path.splitext(abs_out)
+    return f"{stem}-{tag}{ext}"
+
+
+def find_merged_outputs(abs_out):
+    """Existing outputs of earlier merges, as {split: [paths, oldest first]}.
+
+    Covers the unsplit file ("none") and split files of every granularity, so
+    a run can pick up where an earlier one left off even if it used a different
+    --split setting.
+    """
+    folder, name = os.path.split(abs_out)
+    stem, ext = os.path.splitext(name)
+    pattern = re.compile(
+        re.escape(stem)
+        + r"-(?P<year>\d{4})(?:-(?P<month>0[1-9]|1[0-2])|-q(?P<quarter>[1-4]))?"
+        + re.escape(ext)
+        + "$",
+        re.IGNORECASE,
+    )
+    found = {}
+    if os.path.isfile(abs_out):
+        found["none"] = [((0, 0), abs_out)]
+    for n in os.listdir(folder):
+        m = pattern.match(n)
+        path = os.path.join(folder, n)
+        if not m or not os.path.isfile(path):
+            continue
+        year = int(m.group("year"))
+        if m.group("month"):
+            split, period = "month", (year, int(m.group("month")))
+        elif m.group("quarter"):
+            split, period = "quarter", (year, int(m.group("quarter")))
+        else:
+            split, period = "year", (year, 0)
+        found.setdefault(split, []).append((period, path))
+    return {split: [p for _, p in sorted(items)] for split, items in found.items()}
+
+
+class OutputWriter:
+    """Routes merged entries to the output file, or to one file per period.
+
+    Every file is first written as "<name>.tmp" and only swapped in by
+    commit(), so an interrupted run leaves all existing outputs untouched.
+
+    The current period never moves backwards. Thread jitter and DST seams can
+    put an entry's clock slightly before the previous one; such an entry stays
+    in the current file rather than reopening the previous period. That keeps
+    every file contiguous, so the split files concatenated in period order are
+    exactly the single merged log, and they can be read back as a merge base.
+    """
+
+    def __init__(self, abs_out, split, dry_run):
+        self.abs_out = abs_out
+        self.split = split
+        self.dry_run = dry_run
+        self.outputs = []  # [final_path, entries_written] in write order
+        self._period = None
+        self._fh = None
+        self._pending = []  # head-less fragments seen before any file is open
+        if split == "none":
+            self._open(abs_out)
+
+    def _open(self, final_path):
+        self.close()
+        self.outputs.append([final_path, 0])
+        if not self.dry_run:
+            self._fh = open(final_path + ".tmp", "w", **IO_KW)
+
+    def write(self, ts, text):
+        """Write one entry; `ts` is None for a head-less fragment."""
+        if self.split != "none" and ts is not None:
+            period = period_of(ts, self.split)
+            if self._period is None or period > self._period:
+                self._period = period
+                self._open(split_path(self.abs_out, self.split, period))
+                for fragment in self._pending:
+                    self._emit(fragment)
+                self._pending = []
+        if not self.outputs:
+            self._pending.append(text)
+            return
+        self._emit(text)
+
+    def _emit(self, text):
+        self.outputs[-1][1] += 1
+        if self._fh is not None:
+            self._fh.write(text)
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def commit(self):
+        self.close()
+        if not self.dry_run:
+            for final_path, _ in self.outputs:
+                os.replace(final_path + ".tmp", final_path)
+
+    def abort(self):
+        self.close()
+        for final_path, _ in self.outputs:
+            tmp = final_path + ".tmp"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
+# ---------------------------------------------------------------------------
 # Merge
 # ---------------------------------------------------------------------------
 
 
-def merge(sets, out_fh, verbose=True, progress=None):
-    """Write de-duplicated entries from `sets` (oldest first) to `out_fh`.
+def merge(sets, out, verbose=True, progress=None):
+    """Write de-duplicated entries from `sets` (oldest first) to `out`.
+
+    `out` is an OutputWriter; it receives each entry's timestamp as well so it
+    can route the entry to its period's file.
 
     De-duplication strategy
     -----------------------
@@ -493,7 +642,7 @@ def merge(sets, out_fh, verbose=True, progress=None):
                 # attach it to. Emit it only if nothing has been written yet.
                 s.orphan_head_lines += 1
                 if watermark is None:
-                    out_fh.write(text)
+                    out.write(None, text)
                     total_kept += 1
                 continue
 
@@ -515,7 +664,7 @@ def merge(sets, out_fh, verbose=True, progress=None):
                     total_dropped += 1
                     continue
 
-            out_fh.write(text)
+            out.write(ts, text)
             s.kept += 1
             total_kept += 1
 
@@ -604,6 +753,16 @@ def main(argv=None):
         ),
     )
     ap.add_argument(
+        "--split",
+        choices=SPLIT_CHOICES,
+        default="none",
+        help=(
+            "write one file per period instead of a single log, named e.g. "
+            "profitview-merged-2026-02.log (month), profitview-merged-2026-q1.log "
+            "(quarter) or profitview-merged-2026.log (year); default: none"
+        ),
+    )
+    ap.add_argument(
         "--fresh",
         action="store_true",
         help="ignore an existing output file instead of merging into it",
@@ -638,12 +797,15 @@ def main(argv=None):
     inputs = args.inputs or ["."]
 
     abs_out = os.path.abspath(args.output)
+    existing = find_merged_outputs(abs_out)
+    existing_paths = {os.path.normcase(p) for paths in existing.values() for p in paths}
     files, skipped = discover_files(inputs)
-    if not files:
+    # Without new exports an existing merged output can still be re-split.
+    if not files and (args.fresh or not existing):
         print("No matching log files found.", file=sys.stderr)
         return 1
     for path in skipped:
-        if os.path.abspath(path) != abs_out:
+        if os.path.normcase(os.path.abspath(path)) not in existing_paths:
             print(f"note: ignoring unrecognised filename {path}", file=sys.stderr)
 
     # Guard against reading and writing the same file.
@@ -658,11 +820,20 @@ def main(argv=None):
 
     # An existing output is the result of an earlier merge: treat it as one more
     # (normally the oldest) export set, so new exports are merged on top of it.
-    base = None
-    if not args.fresh and os.path.isfile(abs_out):
-        base = ExportSet([(datetime.min, 1, abs_out)])
-        sets.append(base)
-        print(f"Using existing {args.output} as merge base.", file=sys.stderr)
+    # Split files are consecutive slices of one merged stream, so each split
+    # granularity forms one set with its files as the chunks, oldest first.
+    bases = []
+    if not args.fresh:
+        for split in SPLIT_CHOICES:
+            paths = existing.get(split)
+            if not paths:
+                continue
+            base = ExportSet([(datetime.min, i, p) for i, p in enumerate(paths, 1)])
+            if len(paths) > 1:
+                base.name = f"{os.path.basename(paths[0])} (+{len(paths) - 1} more)"
+            bases.append(base)
+            sets.append(base)
+            print(f"Using existing {base.label} as merge base.", file=sys.stderr)
 
     # Order sets by the first entry they actually contain. The export stamp in
     # the filename is only a proxy for this and can mislead if an export was
@@ -706,21 +877,16 @@ def main(argv=None):
     for s in sets:
         s.first_ts = None  # recomputed during the merge
 
-    # Write next to the output and swap it in at the end: the output may be our
+    # Write next to the output(s) and swap in at the end: the outputs may be our
     # own base input, and an interrupted run must not leave a truncated log.
-    out_path = os.devnull if args.dry_run else abs_out + ".tmp"
+    out = OutputWriter(abs_out, args.split, args.dry_run)
     bar = Progress("Merging     ", total_in, enabled=show_progress)
     try:
-        with open(out_path, "w", **IO_KW) as out_fh:
-            kept, dropped, gaps = merge(
-                sets, out_fh, verbose=not args.quiet, progress=bar
-            )
+        kept, dropped, gaps = merge(sets, out, verbose=not args.quiet, progress=bar)
         bar.close()
-        if not args.dry_run:
-            os.replace(out_path, abs_out)
+        out.commit()
     except BaseException:
-        if not args.dry_run and os.path.exists(out_path):
-            os.remove(out_path)
+        out.abort()
         raise
 
     first = min((s.first_ts for s in sets if s.first_ts), default=None)
@@ -731,7 +897,7 @@ def main(argv=None):
     lines.append("Summary")
     lines.append("-------")
     lines.append(f"  input files      : {len(files)} in {len(sets)} export sets ({human(total_in)})")
-    if base is not None:
+    for base in bases:
         note = f" ({base.dropped:,} superseded)" if base.dropped else ""
         lines.append(f"  merge base       : {base.label}, {base.kept:,} entries carried over{note}")
     lines.append(f"  entries written  : {kept:,}")
@@ -740,10 +906,36 @@ def main(argv=None):
         lines.append(f"  overlap          : {dropped / (kept + dropped) * 100:.1f}% of parsed entries")
     if first and last:
         lines.append(f"  time range       : {first} .. {last}")
-    if not args.dry_run:
-        lines.append(f"  output           : {args.output} ({human(os.path.getsize(args.output))})")
-    else:
+    if args.dry_run:
         lines.append("  output           : (dry run, nothing written)")
+    elif args.split == "none":
+        lines.append(f"  output           : {args.output} ({human(os.path.getsize(abs_out))})")
+    else:
+        size = sum(os.path.getsize(p) for p, _ in out.outputs)
+        lines.append(f"  output           : {len(out.outputs)} {args.split} file(s) ({human(size)})")
+    if args.split != "none":
+        verb = "would write" if args.dry_run else "wrote"
+        for path, count in out.outputs:
+            lines.append(f"    {os.path.basename(path):<40} {verb} {count:>9,} entries")
+
+    # Earlier outputs this run did not rewrite (another --split setting, or a
+    # --fresh rebuild that no longer reaches that period) are left in place.
+    # They would be read back as merge base next time; point them out.
+    written = {os.path.normcase(p) for p, _ in out.outputs}
+    leftovers = [
+        p for paths in existing.values() for p in paths
+        if os.path.normcase(p) not in written
+    ]
+    if leftovers and not args.dry_run:
+        lines.append("")
+        lines.append(
+            f"  note: {len(leftovers)} earlier merged file(s) were not rewritten by this run;"
+        )
+        lines.append(
+            "  they are read back as merge base on the next run. Delete them if unwanted:"
+        )
+        for p in leftovers:
+            lines.append(f"    {os.path.basename(p)}")
 
     shifted = [s for s in sets if s.shift]
     if shifted:

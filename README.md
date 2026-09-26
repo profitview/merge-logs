@@ -62,6 +62,7 @@ python merge_logs.py [inputs ...] [options]
 | Option | Description |
 | --- | --- |
 | `-o`, `--output FILE` | Output file (default: `profitview-merged.log`). If it already exists, it is used as the merge base. |
+| `--split PERIOD` | Write one file per `month`, `quarter` or `year` instead of a single file (default: `none`). See [Splitting the output](#splitting-the-output). |
 | `--fresh` | Ignore an existing output file and rebuild only from the export chunks. |
 | `-n`, `--dry-run` | Analyse and print the summary, but write nothing. |
 | `--report FILE` | Also write the summary to this file. |
@@ -78,6 +79,9 @@ python merge_logs.py
 # Check first what a merge would do
 python merge_logs.py --dry-run
 
+# One merged file per month: profitview-merged-2026-02.log, ...
+python merge_logs.py --split month
+
 # Collect exports from several folders
 python merge_logs.py . archive/2026-q2
 
@@ -89,6 +93,25 @@ python merge_logs.py logs/ -o bot-a.log --report bot-a-report.txt
 ```
 
 Input files must follow the export naming scheme `<prefix>-YYYY-MM-DD-HH-MM-SS-<chunk>.log`. Other `.log` files are ignored, and the tool prints a note for each one it skips.
+
+## Splitting the output
+
+With `--split`, the merged log is written as one file per period. The period is added to the output file name:
+
+| `--split` | Example file name |
+| --- | --- |
+| `month` | `profitview-merged-2026-02.log` |
+| `quarter` | `profitview-merged-2026-q1.log` |
+| `year` | `profitview-merged-2026.log` |
+
+Pass the same `--split` option on every run. Existing split files are read back as the merge base, the same way a single `profitview-merged.log` is, and only the periods that get new entries actually change.
+
+Some details:
+
+- **Any existing merged output is used as the base.** This includes the single file and split files of every granularity. So you can switch granularity at any time without keeping the original exports: running `python merge_logs.py --split month` next to an existing `profitview-merged.log` splits it into monthly files. Afterwards the summary lists earlier merged files that the run did not rewrite, such as the old single file. Delete them once you no longer need them. Until you do, every run reads them again as a base, which is harmless but slower.
+- **No new exports needed.** If the folder has no export chunks, the tool still runs as long as a merged output exists, so a plain re-split works.
+- **Files are contiguous.** An entry goes into the file of its timestamp's period. The period never goes backwards, though: an entry whose clock is slightly earlier than the one before it stays in the current file. This happens with thread jitter, or when a DST seam moves the clock back across a month boundary. As a result, the split files concatenated in order are byte-for-byte identical to the single merged log.
+- **Month boundaries use the timestamps as written.** Entries near a DST seam can be up to an hour off from the true time, so an entry from just after midnight on the 1st can end up in the previous month's file, or the other way round.
 
 ## Example output
 
