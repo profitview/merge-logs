@@ -12,6 +12,8 @@ profitview-2026-09-16-14-57-06-2.log
 profitview-2026-09-16-14-57-07-3.log
 ```
 
+An export smaller than 10 MB is not split and has no chunk suffix, e.g. `profitview-2026-11-06-13-08-40.log`. Both forms are supported and can be mixed in the same folder.
+
 That is awkward for three reasons:
 
 - **Exports overlap.** ProfitView only keeps a limited log history, so each new export repeats a long stretch of entries you already have from the previous one.
@@ -92,7 +94,7 @@ python merge_logs.py --fresh
 python merge_logs.py logs/ -o bot-a.log --report bot-a-report.txt
 ```
 
-Input files must follow the export naming scheme `<prefix>-YYYY-MM-DD-HH-MM-SS-<chunk>.log`. Other `.log` files are ignored, and the tool prints a note for each one it skips.
+Input files must follow the export naming scheme `<prefix>-YYYY-MM-DD-HH-MM-SS-<chunk>.log`, or `<prefix>-YYYY-MM-DD-HH-MM-SS.log` for an unsplit export. Other `.log` files are ignored, and the tool prints a note for each one it skips.
 
 ## Splitting the output
 
@@ -138,7 +140,7 @@ Progress bars are only drawn when the output goes to a terminal, so redirected o
 
 ## How it works
 
-1. **Group chunks into exports.** A chunk numbered `1` starts a new export. The timestamp in the filename changes by a second or so from chunk to chunk, so the tool cannot use it to group chunks.
+1. **Group chunks into exports.** A chunk numbered `1` starts a new export. A file without a chunk suffix is a complete export on its own. The timestamp in the filename changes by a second or so from chunk to chunk, so the tool cannot use it to group chunks.
 2. **Order exports** oldest first, by the first log entry each one actually contains. An existing merged log is treated as one more export, normally the oldest.
 3. **Read each export as one continuous stream.** The chunks are joined before parsing, so an entry split across two chunks stays whole. An entry is a timestamped line plus any following lines without a timestamp.
 4. **Detect timezone shifts.** Entries that appear only once near the start of each export are looked up in the previous export. The most common time difference, rounded to whole hours, is that export's shift.
