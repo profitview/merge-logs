@@ -6,7 +6,8 @@ Merge and de-duplicate split ProfitView log exports.
 Background
 ----------
 Logs are exported as "profitview-YYYY-MM-DD-HH-MM-SS-N.log", split into ~10MB
-chunks (N = 1..x, chunk 1 oldest). Exports are taken at irregular intervals and
+chunks (N = 1..x, chunk 1 oldest). An export below 10MB is not split and has no
+suffix: "profitview-YYYY-MM-DD-HH-MM-SS.log". Both forms can be mixed. Exports are taken at irregular intervals and
 the source tool purges its oldest entries internally, so consecutive exports
 overlap heavily: a newer export re-contains a long tail of what an older one
 already had.
@@ -67,10 +68,15 @@ from datetime import datetime, timedelta
 # ---------------------------------------------------------------------------
 
 # "profitview-2026-03-11-19-22-11-1.log" -> export stamp, chunk number
+# "profitview-2026-03-11-19-22-11.log"   -> export stamp, no chunk (single file)
 FILENAME_RE = re.compile(
-    r"^(?P<prefix>.+?)-(?P<stamp>\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})-(?P<chunk>\d+)\.log$",
+    r"^(?P<prefix>.+?)-(?P<stamp>\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})(?:-(?P<chunk>\d+))?\.log$",
     re.IGNORECASE,
 )
+
+# Chunk number recorded for an unsplit export (no "-N" suffix). Such a file is a
+# complete export on its own and always forms a set by itself.
+SINGLE_CHUNK = 0
 
 # "2025-12-11 19:43:15.556 DEBUG ..." -> start of a new entry.
 # Anything not matching this is a continuation of the previous entry.
@@ -263,7 +269,9 @@ def discover_files(inputs):
                     skipped.append(path)
                 continue
             stamp = datetime.strptime(m.group("stamp"), "%Y-%m-%d-%H-%M-%S")
-            found.append((stamp, int(m.group("chunk")), os.path.abspath(path)))
+            chunk = m.group("chunk")
+            chunk = int(chunk) if chunk is not None else SINGLE_CHUNK
+            found.append((stamp, chunk, os.path.abspath(path)))
 
     # De-duplicate identical paths supplied twice (e.g. overlapping arguments).
     found = sorted(set(found))
@@ -280,11 +288,20 @@ def group_into_sets(files):
     reliable set delimiter; a large stamp gap or a break in the numbering also
     starts a new set, so malformed input degrades gracefully instead of merging
     two unrelated exports.
+
+    An unsplit export (no "-N" suffix, below the 10MB split size) is complete in
+    itself: it always becomes its own set and also closes any set in progress.
     """
     sets = []
     current = []
     for entry in files:
         stamp, chunk, _ = entry
+        if chunk == SINGLE_CHUNK:
+            if current:
+                sets.append(ExportSet(current))
+                current = []
+            sets.append(ExportSet([entry]))
+            continue
         if current:
             prev_stamp, prev_chunk, _ = current[-1]
             new_set = (
